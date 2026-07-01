@@ -162,6 +162,22 @@ uv run main.py --ultrasonic --openai -p "Test" -v
 uv run main.py --tts --openai -p "Hello world"
 ```
 
+### Loopback Testing (encode → decode)
+
+Round-trip text through the full pipeline — encode to audio samples,
+optionally add channel noise, decode back — with no LLM or audio device:
+
+```bash
+# Clean loopback at 1000 chars/sec
+uv run main.py --loopback --ultrasonic --tone-duration 1 -t "Hello world"
+
+# DTMF survives extreme noise (0 dB SNR)
+uv run main.py --loopback --dtmf --snr 0 -t "Robust"
+
+# Short ultrasonic tones break down in noise (the speed/robustness tradeoff)
+uv run main.py --loopback --ultrasonic --tone-duration 1 --snr 10 -t "Fragile"
+```
+
 ### Benchmarking
 
 ```bash
@@ -204,6 +220,11 @@ llm-fm/
 │   │   ├── dtmf.py             # DTMF dual-tone
 │   │   ├── fsk.py              # FSK single-tone
 │   │   └── ultrasonic.py       # High-frequency encoding
+│   ├── decoders/               # Frequency decoding (receive side)
+│   │   ├── detection.py        # Correlator-bank tone detection
+│   │   ├── dtmf.py             # DTMF dual-tone decoder
+│   │   ├── fsk.py              # FSK decoder
+│   │   └── ultrasonic.py       # Ultrasonic decoder
 │   ├── audio/                  # Audio generation
 │   │   ├── tone.py             # Sine wave synthesis
 │   │   └── player.py           # Sounddevice playback
@@ -218,14 +239,34 @@ llm-fm/
 
 ### Frequency Detection
 
-Decoding (not yet implemented) would use FFT-based peak detection:
+Decoding uses a **correlator bank** rather than FFT peak-picking. Because the
+transmitter's alphabet is known, each symbol window is correlated against a
+complex exponential at every candidate frequency (the DTFT evaluated exactly
+at the candidate points) and the strongest response wins. For a single tone
+in white noise this is the maximum-likelihood detector.
 
-1. Sample audio at 44.1kHz
-2. Apply windowed FFT (e.g., Hanning window)
-3. Detect frequency peaks above threshold
-4. Map frequencies back to characters
+This matters because of the time-bandwidth product: a T-second window smears
+energy over ~1/T Hz, so a 5ms ultrasonic tone has ~200 Hz of intrinsic
+frequency uncertainty — an FFT peak can't resolve candidates spaced 19.6 Hz
+apart. The correlator bank sidesteps this in *clean* channels (the true
+candidate always correlates strongest), but the margin between neighboring
+candidates shrinks with tone length, so noise tolerance degrades:
 
-For ultrasonic, the 5kHz bandwidth (15-20kHz) provides ~19.6 Hz spacing between 256 symbols, well within FFT resolution at typical sample rates.
+| Scheme | Tone | Clean loopback | Noise tolerance |
+|--------|------|----------------|-----------------|
+| DTMF (16 symbols) | 100ms | 100% | 100% at 0 dB SNR |
+| FSK (256 symbols) | 100ms | 100% | ~100% at 10 dB SNR |
+| Ultrasonic (256 symbols) | 5ms | 100% | ~100% at 30 dB SNR |
+| Ultrasonic (256 symbols) | 1ms | 100% | breaks down below ~20 dB SNR |
+
+The speed/robustness tradeoff is fundamental: fewer symbols spaced further
+apart (or longer tones) buy noise margin at the cost of throughput. A
+realistic over-the-air mode would shrink the alphabet (e.g. 16 symbols
+spaced ~300 Hz) or use multiple simultaneous tones (MFSK, as ggwave does).
+
+The current decoder assumes the waveform starts at the first symbol boundary
+and the receiver knows the tone duration (true in loopback; over-the-air use
+needs a sync preamble — see Future Work).
 
 ### Tone Duration Limits
 
@@ -245,7 +286,8 @@ For transmission over telephony networks:
 
 ## Future Work
 
-- [ ] Implement frequency decoder (FFT-based)
+- [x] Implement frequency decoder (correlator bank, loopback-tested)
+- [ ] Sync preamble for symbol alignment over real channels
 - [ ] Add error correction (Reed-Solomon)
 - [ ] WebRTC transport layer
 - [ ] Bidirectional agent communication

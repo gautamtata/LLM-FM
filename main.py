@@ -119,6 +119,64 @@ async def run_tts(args: argparse.Namespace, provider) -> None:
     print("Done.")
 
 
+def run_loopback(args: argparse.Namespace) -> None:
+    """Run loopback mode: encode -> audio samples -> decode, no audio device."""
+    import time
+
+    import numpy as np
+
+    from src.tfsp.audio.tone import render_frame
+    from src.tfsp.decoders import DTMFDecoder, FSKDecoder, UltrasonicDecoder
+
+    text = args.benchmark_text or args.prompt
+    if not text:
+        text = "The quick brown fox jumps over the lazy dog"
+
+    if args.dtmf:
+        encoder = DTMFEncoder(tone_duration_ms=args.tone_duration)
+        decoder = DTMFDecoder(tone_duration_ms=args.tone_duration)
+        encoding_name = "DTMF"
+    elif args.fsk:
+        encoder = FSKEncoder(tone_duration_ms=args.tone_duration)
+        decoder = FSKDecoder(tone_duration_ms=args.tone_duration)
+        encoding_name = "FSK"
+    else:
+        duration = args.tone_duration if args.tone_duration != 100 else 5
+        encoder = UltrasonicEncoder(tone_duration_ms=duration)
+        decoder = UltrasonicDecoder(tone_duration_ms=duration)
+        encoding_name = "Ultrasonic"
+
+    print(f"Loopback test: {encoding_name} @ {encoder.tone_duration_ms}ms tones")
+    print("-" * 40)
+    print(f"Input   : {text!r}")
+
+    t0 = time.perf_counter()
+    frame = encoder.encode(text)
+    samples = render_frame(frame)
+    encode_ms = (time.perf_counter() - t0) * 1000
+
+    if args.snr is not None:
+        rng = np.random.default_rng()
+        signal_power = np.mean(samples.astype(np.float64) ** 2)
+        noise_power = signal_power / (10 ** (args.snr / 10))
+        samples = samples + rng.normal(0, np.sqrt(noise_power), len(samples))
+        print(f"Channel : AWGN at {args.snr:.0f} dB SNR")
+
+    t0 = time.perf_counter()
+    decoded = decoder.decode(samples)
+    decode_ms = (time.perf_counter() - t0) * 1000
+
+    matches = sum(e == a for e, a in zip(text, decoded))
+    accuracy = matches / len(text) if text else 1.0
+    airtime_ms = len(samples) / 44100 * 1000
+
+    print(f"Decoded : {decoded!r}")
+    print("-" * 40)
+    print(f"Accuracy: {accuracy:.1%} ({matches}/{len(text)} chars)")
+    print(f"Airtime : {airtime_ms:.0f}ms ({len(text) / (airtime_ms / 1000):.0f} chars/sec)")
+    print(f"Encode  : {encode_ms:.1f}ms   Decode: {decode_ms:.1f}ms")
+
+
 def run_benchmark(args: argparse.Namespace) -> None:
     """Run benchmark comparing all methods."""
     from src.tfsp.benchmark import main as benchmark_main
@@ -215,6 +273,19 @@ Examples:
         help="Run benchmark comparing all encoding methods",
     )
 
+    parser.add_argument(
+        "--loopback",
+        action="store_true",
+        help="Loopback test: encode -> samples -> decode (no LLM or audio device)",
+    )
+    parser.add_argument(
+        "--snr",
+        type=float,
+        default=None,
+        metavar="DB",
+        help="Add white noise at this SNR (dB) in loopback mode",
+    )
+
     # Optional
     parser.add_argument(
         "-bt",
@@ -264,6 +335,13 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    # Handle loopback mode (no LLM or audio device needed)
+    if args.loopback:
+        if not any([args.dtmf, args.fsk, args.ultrasonic]):
+            parser.error("--loopback requires --dtmf, --fsk, or --ultrasonic")
+        run_loopback(args)
+        return
 
     # Handle benchmark mode
     if args.benchmark:
